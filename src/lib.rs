@@ -22,20 +22,20 @@ struct JValues<'s> {
 }
 
 #[derive(Debug, PartialEq)]
-enum ParserErrors {
+enum TokenizerErrors {
     EndOfData,
     NeedMoreData,
-    NeedTokenizer,
-    WrongEscapeSequence,
+    WrongEscapeSequence(usize),
+    WrongFormat(usize),
 }
 
-struct Parser {
+struct Tokenizer {
     scratch: std::string::String,
-    state: ParserState,
+    state: TokenizerState,
     index: usize,
 }
 
-enum ParserState {
+enum TokenizerState {
     Base,
     ZeroCopyString,
     StartEscaping,
@@ -43,17 +43,17 @@ enum ParserState {
     ReadingHex(u64, i8),
 }
 
-impl<'s, 'scratch: 's> Parser {
-    fn parse(&'scratch mut self, data: &'s str) -> Result<JValues<'s>, ParserErrors> {
+impl<'s, 'scratch: 's> Tokenizer {
+    fn tokenize(&'scratch mut self, data: &'s str) -> Result<JValues<'s>, TokenizerErrors> {
         match self.state {
-            ParserState::Base => self.parse_base(data),
-            ParserState::ZeroCopyString => self.parse_zero_copy_string(data),
-            ParserState::StartEscaping { .. } => self.parse_start_escaping(data),
-            ParserState::CopyingString { .. } => self.parse_copying_string(data),
-            ParserState::ReadingHex { .. } => self.parse_reading_hex(data),
+            TokenizerState::Base => self.tokenize_base(data),
+            TokenizerState::ZeroCopyString => self.tokenize_zero_copy_string(data),
+            TokenizerState::StartEscaping { .. } => self.tokenize_start_escaping(data),
+            TokenizerState::CopyingString { .. } => self.tokenize_copying_string(data),
+            TokenizerState::ReadingHex { .. } => self.tokenize_reading_hex(data),
         }
     }
-    fn parse_base(&'scratch mut self, data: &'s str) -> Result<JValues<'s>, ParserErrors> {
+    fn tokenize_base(&'scratch mut self, data: &'s str) -> Result<JValues<'s>, TokenizerErrors> {
         for (i, c) in data[self.index..].chars().enumerate() {
             let jt = match c {
                 '{' => JT::OpenObject,
@@ -64,11 +64,11 @@ impl<'s, 'scratch: 's> Parser {
                 ',' => JT::Comma,
                 '"' => {
                     self.index = self.index + i + 1;
-                    self.state = ParserState::ZeroCopyString;
-                    return self.parse_zero_copy_string(data);
+                    self.state = TokenizerState::ZeroCopyString;
+                    return self.tokenize_zero_copy_string(data);
                 }
                 c if c.is_whitespace() => JT::WhiteSpace,
-                _ => unimplemented!(),
+                _ => return Err(TokenizerErrors::WrongFormat(self.index + i)),
             };
             match jt {
                 JT::WhiteSpace => {}
@@ -82,45 +82,44 @@ impl<'s, 'scratch: 's> Parser {
                 }
             }
         }
-        Err(ParserErrors::NeedMoreData)
+        Err(TokenizerErrors::NeedMoreData)
     }
-    fn parse_zero_copy_string(
+    fn tokenize_zero_copy_string(
         &'scratch mut self,
         data: &'s str,
-    ) -> Result<JValues<'s>, ParserErrors> {
+    ) -> Result<JValues<'s>, TokenizerErrors> {
         let begin = self.index;
         for (i, c) in data[self.index..].chars().enumerate() {
             match c {
                 '"' => {
                     self.index = self.index + i + 1;
-                    self.state = ParserState::Base;
+                    self.state = TokenizerState::Base;
                     return Ok(JValues {
                         slice: &data[begin..self.index - 1],
                         jt: JT::JString,
                     });
                 }
                 '\\' => {
-                    dbg!(i);
                     self.scratch.truncate(0);
                     self.index = self.index + i + 1;
                     // here we remove the escape byte
                     self.scratch.push_str(&data[begin..self.index - 1]);
-                    self.state = ParserState::StartEscaping;
-                    return self.parse_start_escaping(data);
+                    self.state = TokenizerState::StartEscaping;
+                    return self.tokenize_start_escaping(data);
                 }
                 _ => {}
             }
         }
         self.scratch.truncate(0);
         self.scratch.push_str(&data[begin..]);
-        self.state = ParserState::CopyingString;
+        self.state = TokenizerState::CopyingString;
         self.index = data.len();
-        Err(ParserErrors::NeedMoreData)
+        Err(TokenizerErrors::NeedMoreData)
     }
-    fn parse_start_escaping(
+    fn tokenize_start_escaping(
         &'scratch mut self,
         data: &'s str,
-    ) -> Result<JValues<'scratch>, ParserErrors> {
+    ) -> Result<JValues<'scratch>, TokenizerErrors> {
         if let Some(c) = data[self.index..].chars().nth(0) {
             let to_add = match c {
                 '"' => '"',
@@ -133,28 +132,28 @@ impl<'s, 'scratch: 's> Parser {
                 't' => '\t',
                 'u' => {
                     self.index += 1;
-                    self.state = ParserState::ReadingHex(0, 4);
-                    return self.parse_reading_hex(data);
+                    self.state = TokenizerState::ReadingHex(0, 4);
+                    return self.tokenize_reading_hex(data);
                 }
-                _ => return Err(ParserErrors::WrongEscapeSequence),
+                _ => return Err(TokenizerErrors::WrongEscapeSequence(self.index)),
             };
             self.scratch.push(to_add);
             self.index += 1;
-            self.state = ParserState::CopyingString;
-            return self.parse_copying_string(data);
+            self.state = TokenizerState::CopyingString;
+            return self.tokenize_copying_string(data);
         } else {
-            Err(ParserErrors::NeedMoreData)
+            Err(TokenizerErrors::NeedMoreData)
         }
     }
-    fn parse_copying_string(
+    fn tokenize_copying_string(
         &'scratch mut self,
         data: &'s str,
-    ) -> Result<JValues<'scratch>, ParserErrors> {
+    ) -> Result<JValues<'scratch>, TokenizerErrors> {
         for (i, c) in data[self.index..].chars().enumerate() {
             match c {
                 '"' => {
                     self.index = self.index + i + 1;
-                    self.state = ParserState::Base;
+                    self.state = TokenizerState::Base;
                     return Ok(JValues {
                         slice: &self.scratch,
                         jt: JT::JString,
@@ -162,113 +161,193 @@ impl<'s, 'scratch: 's> Parser {
                 }
                 '\\' => {
                     self.index += i + 1;
-                    self.state = ParserState::StartEscaping;
-                    return self.parse_start_escaping(data);
+                    self.state = TokenizerState::StartEscaping;
+                    return self.tokenize_start_escaping(data);
                 }
                 c => self.scratch.push(c),
             }
         }
-        self.state = ParserState::CopyingString;
+        self.state = TokenizerState::CopyingString;
         self.index = data.len();
-        Err(ParserErrors::NeedMoreData)
+        Err(TokenizerErrors::NeedMoreData)
     }
-    fn parse_reading_hex(
+    fn tokenize_reading_hex(
         &'scratch mut self,
         data: &'s str,
-    ) -> Result<JValues<'scratch>, ParserErrors> {
+    ) -> Result<JValues<'scratch>, TokenizerErrors> {
         unimplemented!()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum F {
+    InObject,
+    InObjectAfterKey,
+    InArray,
+    Key,
+    JString,
+    JNumber,
+}
+
+enum PE {
+    EndOfData,
+    NeedMoreData,
+    WrongEscapeSequence(usize),
+    WrongFormat(usize),
+}
+
+impl From<TokenizerErrors> for PE {
+    fn from(error: TokenizerErrors) -> Self {
+        match error {
+            TokenizerErrors::EndOfData => PE::EndOfData,
+            TokenizerErrors::NeedMoreData => PE::NeedMoreData,
+            TokenizerErrors::WrongEscapeSequence(u) => PE::WrongEscapeSequence(u),
+            TokenizerErrors::WrongFormat(u) => PE::WrongFormat(u),
+        }
+    }
+}
+
+struct Parser {
+    stack: std::vec::Vec<F>,
+    tokenizer: Tokenizer,
+}
+type PR<'s> = (F, Option<&'s str>);
+
+enum PR2<'s> {
+    InObject,
+    InArray,
+    Key(&'s str),
+    JString(&'s str),
+}
+
+impl<'s, 'ss: 's> Parser {
+    fn parse(&'ss mut self, data: &'s str) -> Result<PR<'s>, PE> {
+        let index = self.tokenizer.index;
+        let token = self.tokenizer.tokenize(data)?;
+        let state = self.stack.last();
+        let result = match (state, token.jt) {
+            (None, JT::OpenObject) => {
+                self.stack.push(F::InObject);
+                (F::InObject, None)
+            }
+            (None, JT::OpenArray) => {
+                self.stack.push(F::InArray);
+                (F::InArray, None)
+            }
+            (None, JT::JString) => (F::JString, Some(token.slice)),
+            (None, JT::JNumber) => (F::JNumber, None),
+            (None, _) => return Err(PE::WrongFormat(index)),
+
+            (Some(F::InObject), JT::JString) => {
+                self.stack.push(F::Key);
+                (F::JString, Some(token.slice))
+            }
+            /*
+            (Some(F::Key), JT::Comma) => {
+                self.stack.push(F::InObjectAfterKey);
+                return self.parse(data);
+            }
+            */
+            (Some(F::InObjectAfterKey), JT::JString) => {
+                self.stack.pop();
+                (F::JString, Some(token.slice))
+            }
+
+            (_, _) => unimplemented!(),
+        };
+        Ok(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
 
-    use crate::{Parser, ParserErrors, ParserState, JT};
+    use crate::{Tokenizer, TokenizerErrors, TokenizerState, JT};
 
     #[test]
-    fn parser2_open_close_curly() {
-        let mut parser = Parser {
+    fn tokenizer2_open_close_curly() {
+        let mut tokenizer = Tokenizer {
             scratch: std::string::String::new(),
-            state: ParserState::Base,
+            state: TokenizerState::Base,
             index: 0,
         };
         let data = "{}";
-        let open = parser.parse(data).unwrap();
+        let open = tokenizer.tokenize(data).unwrap();
         assert_eq!(open.jt, JT::OpenObject);
         assert_eq!(open.slice, "{");
-        let close = parser.parse(data).unwrap();
+        let close = tokenizer.tokenize(data).unwrap();
         assert_eq!(close.jt, JT::CloseObject);
         assert_eq!(close.slice, "}");
-        let error = parser.parse(data);
+        let error = tokenizer.tokenize(data);
         assert!(error.is_err());
     }
 
     #[test]
-    fn parse_simple_string() {
-        let mut parser = Parser {
+    fn tokenize_simple_string() {
+        let mut tokenizer = Tokenizer {
             scratch: std::string::String::new(),
-            state: ParserState::Base,
+            state: TokenizerState::Base,
             index: 0,
         };
         let data = "    \"foo_ _bar\"  ";
-        let string = parser.parse(data).unwrap();
+        let string = tokenizer.tokenize(data).unwrap();
         assert_eq!(string.jt, JT::JString);
         assert_eq!(string.slice, "foo_ _bar");
     }
 
     #[test]
-    fn parse_string_multiple_buffers() {
-        let mut parser = Parser {
+    fn tokenize_string_multiple_buffers() {
+        let mut tokenizer = Tokenizer {
             scratch: std::string::String::new(),
-            state: ParserState::Base,
+            state: TokenizerState::Base,
             index: 0,
         };
         let data = "    \"foo";
-        let string = parser.parse(data);
+        let string = tokenizer.tokenize(data);
         assert!(string.is_err());
 
-        parser.index = 0;
+        tokenizer.index = 0;
         let data = " bar\" \"ok\"";
 
-        let string = parser.parse(data).unwrap();
+        let string = tokenizer.tokenize(data).unwrap();
         assert_eq!(string.jt, JT::JString);
         assert_eq!(string.slice, "foo bar");
 
-        let ok = parser.parse(data).unwrap();
+        let ok = tokenizer.tokenize(data).unwrap();
         assert_eq!(ok.jt, JT::JString);
         assert_eq!(ok.slice, "ok");
 
-        let err = parser.parse(data).is_err();
+        let err = tokenizer.tokenize(data).is_err();
         assert!(err);
 
-        parser.index = 0;
+        tokenizer.index = 0;
         let data = "\"again\"";
 
-        let again = parser.parse(data).unwrap();
+        let again = tokenizer.tokenize(data).unwrap();
         assert_eq!(again.jt, JT::JString);
         assert_eq!(again.slice, "again");
 
-        let err = parser.parse(data).is_err();
+        let err = tokenizer.tokenize(data).is_err();
         assert!(err);
 
-        parser.index = 0;
+        tokenizer.index = 0;
         let data = "\"with\\nnewlines\\n\"";
-        let new_line = parser.parse(data).unwrap();
+        let new_line = tokenizer.tokenize(data).unwrap();
         assert_eq!(new_line.jt, JT::JString);
         assert_eq!(new_line.slice, "with\nnewlines\n");
 
-        let err = parser.parse(data).is_err();
+        let err = tokenizer.tokenize(data).is_err();
         assert!(err);
 
-        parser.index = 0;
+        tokenizer.index = 0;
         let data = "\"foo\\";
 
-        let err = parser.parse(data);
-        assert_eq!(ParserErrors::NeedMoreData, err.err().unwrap());
+        let err = tokenizer.tokenize(data);
+        assert_eq!(TokenizerErrors::NeedMoreData, err.err().unwrap());
 
-        parser.index = 0;
+        tokenizer.index = 0;
         let data = "nbar\"";
-        let different_string_escape = parser.parse(data).unwrap();
+        let different_string_escape = tokenizer.tokenize(data).unwrap();
         assert_eq!(different_string_escape.jt, JT::JString);
         assert_eq!(different_string_escape.slice, "foo\nbar");
     }
